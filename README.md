@@ -1,42 +1,67 @@
 # ballcoach-media
 
-Minimal Go microservice that serves media files (profile photos, audio) from a mounted volume. Built for Railway.
+BallCoach Media API service for storing and serving avatars, exercise images, and meditation MP3 tracks from persistent filesystem storage.
 
 ## Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/health` | Returns `{"status":"ok"}` |
-| GET | `/media/{filename}` | Serves the requested file with correct MIME type |
+| `POST` | `/avatars` | Upload avatar image (`file`, `filename`) |
+| `POST` | `/exercise-images` | Upload exercise image (`file`, `filename`) |
+| `POST` | `/meditation-tracks` | Upload meditation MP3 (`file`, `filename`) |
+| `GET` | `/avatars/{filename}` | Serve avatar image |
+| `GET` | `/exercise-images/{filename}` | Serve exercise image |
+| `GET` | `/meditation-tracks/{filename}/stream` | Stream meditation MP3 with range support |
+| `DELETE` | `/avatars/{filename}` | Delete avatar |
+| `DELETE` | `/exercise-images/{filename}` | Delete exercise image |
+| `DELETE` | `/meditation-tracks/{filename}` | Delete meditation track |
+| `GET` | `/health` | Health + storage/disk check |
 
-Supported formats: JPEG, PNG, WebP, MP3, MP4, AAC, M4A.
+## Storage Layout
+
+```
+MEDIA_STORAGE_PATH/
+├── avatars/
+├── exercise-images/
+└── meditation-tracks/
+```
+
+## Validation Rules
+
+- Avatar and exercise images:
+  - Max `10MB`
+  - Allowed MIME/types: JPEG, PNG, WebP, HEIC
+  - Required multipart fields: `file`, `filename`
+- Meditation tracks:
+  - Max `50MB`
+  - Allowed MIME/type: MP3 (`audio/mpeg`)
+  - Required multipart fields: `file`, `filename`
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `8080` | HTTP listen port (Railway sets this automatically) |
-| `MEDIA_DIR` | `/data` | Base directory where media files are stored |
-
-## Railway Setup
-
-1. Create a new project and link this repo.
-2. Add a **Volume** to the service:
-   - Mount path: `/data`
-   - This is where uploaded media files will live.
-3. Railway will build the Dockerfile automatically. No extra env vars needed unless you want a custom `MEDIA_DIR`.
+| `PORT` | `3001` | HTTP listen port |
+| `MEDIA_STORAGE_PATH` | `/data/media` | Base storage directory |
+| `MEDIA_API_BASE_URL` | unset | Used to build `full_url` upload response field |
+| `CORS_ORIGINS` | unset | Comma-separated origins for `POST`/`DELETE` CORS |
 
 ## Local Development
 
 ```bash
-go run .                           # serves from /data on :8080
-MEDIA_DIR=./testdata go run .      # serves from a local directory
+go run .
 ```
 
-## Example Request
+With custom storage path:
 
-```
-GET https://your-service.up.railway.app/media/avatar-abc123.jpg
+```bash
+MEDIA_STORAGE_PATH=./data go run .
 ```
 
-Response: the image bytes with `Content-Type: image/jpeg` and `Access-Control-Allow-Origin: *`.
+## Example Upload
+
+```bash
+curl -X POST http://localhost:3001/avatars \
+  -F "file=@./avatar.jpg" \
+  -F "filename=user123-1712937600.jpg"
+```
