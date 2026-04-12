@@ -100,6 +100,54 @@ func main() {
 		})
 	})
 
+	// TEMPORARY: List migrated files (will be removed after verification)
+	r.Get("/admin/list-files", func(w http.ResponseWriter, r *http.Request) {
+		result := map[string]any{
+			"avatars":          []string{},
+			"exercise_images":  []string{},
+			"meditation_tracks": []string{},
+		}
+
+		// List avatars
+		avatarDir := filepath.Join(storagePath, "avatars")
+		if entries, err := os.ReadDir(avatarDir); err == nil {
+			avatars := make([]string, 0)
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					avatars = append(avatars, entry.Name())
+				}
+			}
+			result["avatars"] = avatars
+		}
+
+		// List exercise images
+		exerciseDir := filepath.Join(storagePath, "exercise-images")
+		if entries, err := os.ReadDir(exerciseDir); err == nil {
+			exercises := make([]string, 0)
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					exercises = append(exercises, entry.Name())
+				}
+			}
+			result["exercise_images"] = exercises
+		}
+
+		// List meditation tracks
+		meditationDir := filepath.Join(storagePath, "meditation-tracks")
+		if entries, err := os.ReadDir(meditationDir); err == nil {
+			tracks := make([]string, 0)
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					tracks = append(tracks, entry.Name())
+				}
+			}
+			result["meditation_tracks"] = tracks
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	})
+
 	r.Post("/avatars", uploadHandler(storagePath, baseURL, uploadConfig{
 		dirName:       "avatars",
 		maxSize:       maxImageSize,
