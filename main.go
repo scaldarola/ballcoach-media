@@ -24,7 +24,7 @@ import (
 
 const (
 	maxImageSize = 10 * 1024 * 1024
-	maxMP3Size   = 50 * 1024 * 1024
+	maxAudioSize = 50 * 1024 * 1024
 )
 
 type uploadConfig struct {
@@ -166,9 +166,9 @@ func main() {
 
 	r.Post("/meditation-tracks", uploadHandler(storagePath, baseURL, uploadConfig{
 		dirName:       "meditation-tracks",
-		maxSize:       maxMP3Size,
-		allowedMIMEs:  set("audio/mpeg"),
-		allowedExts:   set(".mp3"),
+		maxSize:       maxAudioSize,
+		allowedMIMEs:  set("audio/mpeg", "audio/mp4", "audio/aac", "audio/x-m4a", "audio/m4a"),
+		allowedExts:   set(".mp3", ".m4a", ".aac"),
 		responseRoute: "/meditation-tracks/%s/stream",
 	}, true))
 
@@ -260,9 +260,9 @@ func uploadHandler(storagePath, baseURL string, cfg uploadConfig, includeDuratio
 		}
 
 		if includeDuration {
-			durationSeconds, err := calculateMP3DurationSeconds(dstPath)
+			durationSeconds, err := calculateAudioDurationSeconds(dstPath)
 			if err != nil {
-				log.Warn().Err(err).Str("path", dstPath).Msg("failed to calculate mp3 duration")
+				log.Warn().Err(err).Str("path", dstPath).Msg("failed to calculate audio duration")
 			}
 			resp.DurationSeconds = durationSeconds
 		}
@@ -569,7 +569,23 @@ func writeJSONError(w http.ResponseWriter, status int, message string) {
 	_ = json.NewEncoder(w).Encode(errorResponse{Error: message})
 }
 
-func calculateMP3DurationSeconds(path string) (int64, error) {
+func calculateAudioDurationSeconds(path string) (int64, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+
+	switch ext {
+	case ".mp3":
+		return calculateMP3Duration(path)
+	case ".m4a", ".aac":
+		// M4A/AAC duration calculation not implemented yet
+		// Return 0 without error - duration will be 0 in response
+		log.Info().Str("path", path).Msg("M4A/AAC duration calculation not implemented - skipping")
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("unsupported audio format: %s", ext)
+	}
+}
+
+func calculateMP3Duration(path string) (int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, err
@@ -642,6 +658,8 @@ func registerMIMETypes() {
 		".webp": "image/webp",
 		".heic": "image/heic",
 		".mp3":  "audio/mpeg",
+		".m4a":  "audio/mp4",
+		".aac":  "audio/aac",
 	}
 	for ext, ct := range types {
 		mime.AddExtensionType(ext, ct)
