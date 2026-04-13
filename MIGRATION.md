@@ -61,24 +61,28 @@ The Dockerfile has been updated to include `ffmpeg`, which is required for audio
    go run migrate_mp3_to_m4a.go /data/media
    ```
 
-### Option 3: Create a Temporary Endpoint
+### Option 3: Use the Migration Endpoint (Easiest)
 
-If shell access is difficult, you can add a temporary admin endpoint:
+A temporary migration endpoint has been added to the API:
 
-```go
-// Add to main.go temporarily
-r.Post("/admin/migrate-to-m4a", func(w http.ResponseWriter, r *http.Request) {
-    // Run migration inline
-    // ... (copy logic from migrate_mp3_to_m4a.go)
-})
+```bash
+curl -X POST https://your-app.railway.app/admin/migrate-mp3-to-m4a
 ```
 
-Then call it via:
-```bash
-curl -X POST https://your-app.railway.app/admin/migrate-to-m4a
+Response example:
+```json
+{
+  "status": "success",
+  "converted": ["meditation-calm.m4a", "meditation-focus.m4a"],
+  "failed": [],
+  "skipped": [],
+  "errors": []
+}
 ```
 
 **⚠️ Remember to remove this endpoint after migration!**
+
+To remove it, delete the `/admin/migrate-mp3-to-m4a` endpoint from `main.go` and the `migrateMP3ToM4A` function.
 
 ## What the Script Does
 

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -98,6 +99,14 @@ func main() {
 			"storage_available": available,
 			"disk_space_mb":     freeMB,
 		})
+	})
+
+	// TEMPORARY: Migrate MP3 to M4A (will be removed after migration)
+	r.Post("/admin/migrate-mp3-to-m4a", func(w http.ResponseWriter, r *http.Request) {
+		meditationDir := filepath.Join(storagePath, "meditation-tracks")
+		result := migrateMP3ToM4A(meditationDir)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
 	})
 
 	// TEMPORARY: List migrated files (will be removed after verification)
@@ -664,4 +673,92 @@ func registerMIMETypes() {
 	for ext, ct := range types {
 		mime.AddExtensionType(ext, ct)
 	}
+}
+
+func migrateMP3ToM4A(meditationDir string) map[string]any {
+	result := map[string]any{
+		"status":    "success",
+		"converted": []string{},
+		"failed":    []string{},
+		"skipped":   []string{},
+		"errors":    []string{},
+	}
+
+	// Check if directory exists
+	if _, err := os.Stat(meditationDir); os.IsNotExist(err) {
+		result["status"] = "error"
+		result["errors"] = []string{fmt.Sprintf("directory does not exist: %s", meditationDir)}
+		return result
+	}
+
+	// Read directory
+	entries, err := os.ReadDir(meditationDir)
+	if err != nil {
+		result["status"] = "error"
+		result["errors"] = []string{fmt.Sprintf("failed to read directory: %v", err)}
+		return result
+	}
+
+	converted := []string{}
+	failed := []string{}
+	skipped := []string{}
+	errors := []string{}
+
+	for _, entry := range entries {
+		if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".mp3" {
+			continue
+		}
+
+		filename := entry.Name()
+		mp3Path := filepath.Join(meditationDir, filename)
+		m4aFilename := strings.TrimSuffix(filename, ".mp3") + ".m4a"
+		m4aPath := filepath.Join(meditationDir, m4aFilename)
+
+		// Check if M4A already exists
+		if _, err := os.Stat(m4aPath); err == nil {
+			skipped = append(skipped, filename)
+			log.Info().Str("file", filename).Msg("M4A already exists, skipping")
+			continue
+		}
+
+		// Convert using ffmpeg
+		cmd := exec.Command("ffmpeg",
+			"-i", mp3Path,
+			"-c:a", "aac",
+			"-b:a", "128k",
+			"-vn",
+			"-y",
+			m4aPath,
+		)
+
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			errMsg := fmt.Sprintf("%s: %v - %s", filename, err, string(output))
+			failed = append(failed, filename)
+			errors = append(errors, errMsg)
+			log.Error().Str("file", filename).Err(err).Msg("conversion failed")
+			continue
+		}
+
+		// Verify the M4A file was created
+		if stat, err := os.Stat(m4aPath); err == nil {
+			converted = append(converted, m4aFilename)
+			log.Info().Str("file", m4aFilename).Int64("size", stat.Size()).Msg("conversion successful")
+		} else {
+			failed = append(failed, filename)
+			errors = append(errors, fmt.Sprintf("%s: M4A file not created", filename))
+			log.Error().Str("file", filename).Msg("M4A file not created")
+		}
+	}
+
+	result["converted"] = converted
+	result["failed"] = failed
+	result["skipped"] = skipped
+	result["errors"] = errors
+
+	if len(failed) > 0 {
+		result["status"] = "partial"
+	}
+
+	return result
 }
