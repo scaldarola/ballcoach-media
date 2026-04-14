@@ -103,7 +103,11 @@ func main() {
 
 	// TEMPORARY: Migrate MP3 to M4A (will be removed after migration)
 	r.Post("/admin/migrate-mp3-to-m4a", func(w http.ResponseWriter, r *http.Request) {
-		meditationDir := filepath.Join(storagePath, "meditation-tracks")
+		// Try actual volume mount path first, fallback to configured path
+		meditationDir := "/data/meditation-audio"
+		if _, err := os.Stat(meditationDir); os.IsNotExist(err) {
+			meditationDir = filepath.Join(storagePath, "meditation-tracks")
+		}
 		result := migrateMP3ToM4A(meditationDir)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
