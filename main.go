@@ -115,10 +115,11 @@ func main() {
 
 	// TEMPORARY: List migrated files (will be removed after verification)
 	r.Get("/admin/list-files", func(w http.ResponseWriter, r *http.Request) {
-		result := map[string]any{
-			"avatars":          []string{},
-			"exercise_images":  []string{},
-			"meditation_tracks": []string{},
+		result := map[string]interface{}{
+			"avatars":              []string{},
+			"exercise_images":      []string{},
+			"meditation_tracks":    []string{},
+			"meditation_audio_dir": []string{}, // Direct volume mount
 		}
 
 		// List avatars
@@ -155,6 +156,18 @@ func main() {
 				}
 			}
 			result["meditation_tracks"] = tracks
+		}
+
+		// List direct volume mount (actual location)
+		volumeDir := "/data/meditation-audio"
+		if entries, err := os.ReadDir(volumeDir); err == nil {
+			files := make([]string, 0)
+			for _, entry := range entries {
+				if !entry.IsDir() {
+					files = append(files, entry.Name())
+				}
+			}
+			result["meditation_audio_dir"] = files
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -679,8 +692,8 @@ func registerMIMETypes() {
 	}
 }
 
-func migrateMP3ToM4A(meditationDir string) map[string]any {
-	result := map[string]any{
+func migrateMP3ToM4A(meditationDir string) map[string]interface{} {
+	result := map[string]interface{}{
 		"status":    "success",
 		"converted": []string{},
 		"failed":    []string{},
