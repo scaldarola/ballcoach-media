@@ -101,6 +101,46 @@ func main() {
 		})
 	})
 
+	// TEMPORARY: Explore volume contents
+	r.Get("/admin/explore-volume", func(w http.ResponseWriter, r *http.Request) {
+		result := map[string]interface{}{
+			"volume_path":  "/data/meditation-audio",
+			"storage_path": storagePath,
+			"files":        []map[string]interface{}{},
+			"error":        nil,
+		}
+
+		// Check if volume path exists
+		volumePath := "/data/meditation-audio"
+		if stat, err := os.Stat(volumePath); err != nil {
+			result["error"] = fmt.Sprintf("volume path error: %v", err)
+		} else {
+			result["volume_exists"] = true
+			result["volume_is_dir"] = stat.IsDir()
+		}
+
+		// List all files in volume
+		if entries, err := os.ReadDir(volumePath); err == nil {
+			files := make([]map[string]interface{}, 0)
+			for _, entry := range entries {
+				info, _ := entry.Info()
+				files = append(files, map[string]interface{}{
+					"name":  entry.Name(),
+					"is_dir": entry.IsDir(),
+					"size":  info.Size(),
+					"ext":   filepath.Ext(entry.Name()),
+				})
+			}
+			result["files"] = files
+			result["file_count"] = len(files)
+		} else {
+			result["error"] = fmt.Sprintf("failed to read directory: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
+	})
+
 	// TEMPORARY: Migrate MP3 to M4A (will be removed after migration)
 	r.Post("/admin/migrate-mp3-to-m4a", func(w http.ResponseWriter, r *http.Request) {
 		// Try actual volume mount path first, fallback to configured path
