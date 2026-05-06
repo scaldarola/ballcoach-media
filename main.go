@@ -398,6 +398,9 @@ func requestLogger(next http.Handler) http.Handler {
 			Int("status", ww.status).
 			Dur("latency", time.Since(start)).
 			Str("remote_addr", r.RemoteAddr).
+			Str("x_forwarded_for", r.Header.Get("X-Forwarded-For")).
+			Str("x_real_ip", r.Header.Get("X-Real-IP")).
+			Str("client_ip", resolveClientIP(r)).
 			Msg("request complete")
 	})
 }
@@ -458,14 +461,49 @@ func uploadRateLimitMiddleware(limiter *ipRateLimiter) func(http.Handler) http.H
 				return
 			}
 
-			if !limiter.Allow(clientIP(r.RemoteAddr)) {
+			ip := resolveClientIP(r)
+			allowed, count, windowFrom := limiter.AllowDetailed(ip)
+			if !allowed {
+				log.Warn().
+					Str("ip", ip).
+					Str("remote_addr", r.RemoteAddr).
+					Str("x_forwarded_for", r.Header.Get("X-Forwarded-For")).
+					Str("x_real_ip", r.Header.Get("X-Real-IP")).
+					Str("path", r.URL.Path).
+					Int("count", count).
+					Int("limit", limiter.limit).
+					Dur("window", limiter.window).
+					Time("window_from", windowFrom).
+					Msg("rate limit exceeded")
 				writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
 				return
 			}
 
+			log.Debug().
+				Str("ip", ip).
+				Int("count", count).
+				Int("limit", limiter.limit).
+				Msg("rate limit ok")
+
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func resolveClientIP(r *http.Request) string {
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		// X-Forwarded-For can be a comma-separated list; the first entry is the original client.
+		if idx := strings.Index(xff, ","); idx >= 0 {
+			xff = strings.TrimSpace(xff[:idx])
+		}
+		if xff != "" {
+			return xff
+		}
+	}
+	if xri := strings.TrimSpace(r.Header.Get("X-Real-IP")); xri != "" {
+		return xri
+	}
+	return clientIP(r.RemoteAddr)
 }
 
 func newIPRateLimiter(limit int, window, ttl time.Duration) *ipRateLimiter {
@@ -480,6 +518,11 @@ func newIPRateLimiter(limit int, window, ttl time.Duration) *ipRateLimiter {
 }
 
 func (rl *ipRateLimiter) Allow(ip string) bool {
+	allowed, _, _ := rl.AllowDetailed(ip)
+	return allowed
+}
+
+func (rl *ipRateLimiter) AllowDetailed(ip string) (bool, int, time.Time) {
 	now := time.Now()
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -501,10 +544,10 @@ func (rl *ipRateLimiter) Allow(ip string) bool {
 
 	v.lastAccess = now
 	if v.count >= rl.limit {
-		return false
+		return false, v.count, v.windowFrom
 	}
 	v.count++
-	return true
+	return true, v.count, v.windowFrom
 }
 
 func (rl *ipRateLimiter) cleanupLoop() {
