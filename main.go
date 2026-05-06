@@ -461,6 +461,12 @@ func uploadRateLimitMiddleware(limiter *ipRateLimiter) func(http.Handler) http.H
 				return
 			}
 
+			// Image upload endpoints are not rate-limited.
+			if r.URL.Path == "/avatars" || r.URL.Path == "/exercise-images" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			ip := resolveClientIP(r)
 			allowed, count, windowFrom := limiter.AllowDetailed(ip)
 			if !allowed {
