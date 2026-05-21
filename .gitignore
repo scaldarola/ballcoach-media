@@ -1,0 +1,11 @@
+# Compiled binary
+/ballcoach-media
+
+# Local env
+.env
+.env.local
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/

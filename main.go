@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,11 +11,9 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -29,11 +28,14 @@ const (
 )
 
 type uploadConfig struct {
-	dirName       string
-	maxSize       int64
-	allowedMIMEs  map[string]struct{}
-	allowedExts   map[string]struct{}
-	responseRoute string
+	keyPrefix    string
+	maxSize      int64
+	allowedMIMEs map[string]struct{}
+	allowedExts  map[string]struct{}
+	// publicMode=true → respond with the R2 public URL (used for images served via CDN).
+	// publicMode=false → respond with our proxy URL (used for audio that needs range-stream proxying).
+	publicMode  bool
+	streamRoute string // route template used when publicMode=false, e.g. "/meditation-tracks/%s/stream"
 }
 
 type errorResponse struct {
@@ -76,12 +78,22 @@ func main() {
 		port = "3001"
 	}
 
-	storagePath := os.Getenv("MEDIA_STORAGE_PATH")
-	if storagePath == "" {
-		storagePath = "/data/media"
+	baseURL := os.Getenv("MEDIA_API_BASE_URL")
+	legacyStoragePath := os.Getenv("MEDIA_STORAGE_PATH")
+	if legacyStoragePath == "" {
+		legacyStoragePath = "/data/media"
 	}
 
-	baseURL := os.Getenv("MEDIA_API_BASE_URL")
+	r2Cfg, err := loadR2ConfigFromEnv()
+	if err != nil {
+		log.Fatal().Err(err).Msg("R2 not configured")
+	}
+	ctx := context.Background()
+	r2c, err := newR2Client(ctx, r2Cfg)
+	if err != nil {
+		log.Fatal().Err(err).Msg("failed to init R2 client")
+	}
+
 	registerMIMETypes()
 	origins := parseOrigins(os.Getenv("CORS_ORIGINS"))
 	limiter := newIPRateLimiter(20, 10*time.Second, 10*time.Minute)
@@ -92,167 +104,66 @@ func main() {
 	r.Use(uploadRateLimitMiddleware(limiter))
 
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
-		available, freeMB := storageHealth(storagePath)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"status":            "ok",
-			"storage_available": available,
-			"disk_space_mb":     freeMB,
+			"status":  "ok",
+			"backend": "r2",
+			"bucket":  r2Cfg.bucket,
 		})
 	})
 
-	// TEMPORARY: Explore volume contents
-	r.Get("/admin/explore-volume", func(w http.ResponseWriter, r *http.Request) {
-		result := map[string]interface{}{
-			"volume_path":  "/data/meditation-audio",
-			"storage_path": storagePath,
-			"files":        []map[string]interface{}{},
-			"error":        nil,
-		}
-
-		// Check if volume path exists
-		volumePath := "/data/meditation-audio"
-		if stat, err := os.Stat(volumePath); err != nil {
-			result["error"] = fmt.Sprintf("volume path error: %v", err)
-		} else {
-			result["volume_exists"] = true
-			result["volume_is_dir"] = stat.IsDir()
-		}
-
-		// List all files in volume
-		if entries, err := os.ReadDir(volumePath); err == nil {
-			files := make([]map[string]interface{}, 0)
-			for _, entry := range entries {
-				info, _ := entry.Info()
-				files = append(files, map[string]interface{}{
-					"name":  entry.Name(),
-					"is_dir": entry.IsDir(),
-					"size":  info.Size(),
-					"ext":   filepath.Ext(entry.Name()),
-				})
-			}
-			result["files"] = files
-			result["file_count"] = len(files)
-		} else {
-			result["error"] = fmt.Sprintf("failed to read directory: %v", err)
-		}
-
+	// One-shot migration: copies everything under the legacy Railway volume
+	// into R2 with key `<dir>/<filename>`. Idempotent (HeadObject check).
+	r.Post("/admin/migrate-to-r2", func(w http.ResponseWriter, req *http.Request) {
+		result := migrateVolumeToR2(req.Context(), r2c, legacyStoragePath)
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(result)
 	})
 
-	// TEMPORARY: Migrate MP3 to M4A (will be removed after migration)
-	r.Post("/admin/migrate-mp3-to-m4a", func(w http.ResponseWriter, r *http.Request) {
-		// Try actual volume mount path first, fallback to configured path
-		meditationDir := "/data/meditation-audio"
-		if _, err := os.Stat(meditationDir); os.IsNotExist(err) {
-			meditationDir = filepath.Join(storagePath, "meditation-tracks")
-		}
-		result := migrateMP3ToM4A(meditationDir)
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(result)
-	})
-
-	// TEMPORARY: List migrated files (will be removed after verification)
-	r.Get("/admin/list-files", func(w http.ResponseWriter, r *http.Request) {
-		result := map[string]interface{}{
-			"avatars":              []string{},
-			"exercise_images":      []string{},
-			"meditation_tracks":    []string{},
-			"meditation_audio_dir": []string{}, // Direct volume mount
-		}
-
-		// List avatars
-		avatarDir := filepath.Join(storagePath, "avatars")
-		if entries, err := os.ReadDir(avatarDir); err == nil {
-			avatars := make([]string, 0)
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					avatars = append(avatars, entry.Name())
-				}
-			}
-			result["avatars"] = avatars
-		}
-
-		// List exercise images
-		exerciseDir := filepath.Join(storagePath, "exercise-images")
-		if entries, err := os.ReadDir(exerciseDir); err == nil {
-			exercises := make([]string, 0)
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					exercises = append(exercises, entry.Name())
-				}
-			}
-			result["exercise_images"] = exercises
-		}
-
-		// List meditation tracks
-		meditationDir := filepath.Join(storagePath, "meditation-tracks")
-		if entries, err := os.ReadDir(meditationDir); err == nil {
-			tracks := make([]string, 0)
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					tracks = append(tracks, entry.Name())
-				}
-			}
-			result["meditation_tracks"] = tracks
-		}
-
-		// List direct volume mount (actual location)
-		volumeDir := "/data/meditation-audio"
-		if entries, err := os.ReadDir(volumeDir); err == nil {
-			files := make([]string, 0)
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					files = append(files, entry.Name())
-				}
-			}
-			result["meditation_audio_dir"] = files
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(result)
-	})
-
-	r.Post("/avatars", uploadHandler(storagePath, baseURL, uploadConfig{
-		dirName:       "avatars",
-		maxSize:       maxImageSize,
-		allowedMIMEs:  set("image/jpeg", "image/png", "image/webp", "image/heic"),
-		allowedExts:   set(".jpg", ".jpeg", ".png", ".webp", ".heic"),
-		responseRoute: "/avatars/%s",
+	r.Post("/avatars", uploadHandler(r2c, baseURL, uploadConfig{
+		keyPrefix:    "avatars",
+		maxSize:      maxImageSize,
+		allowedMIMEs: set("image/jpeg", "image/png", "image/webp", "image/heic"),
+		allowedExts:  set(".jpg", ".jpeg", ".png", ".webp", ".heic"),
+		publicMode:   true,
 	}, false))
 
-	r.Post("/exercise-images", uploadHandler(storagePath, baseURL, uploadConfig{
-		dirName:       "exercise-images",
-		maxSize:       maxImageSize,
-		allowedMIMEs:  set("image/jpeg", "image/png", "image/webp", "image/heic"),
-		allowedExts:   set(".jpg", ".jpeg", ".png", ".webp", ".heic"),
-		responseRoute: "/exercise-images/%s",
+	r.Post("/exercise-images", uploadHandler(r2c, baseURL, uploadConfig{
+		keyPrefix:    "exercise-images",
+		maxSize:      maxImageSize,
+		allowedMIMEs: set("image/jpeg", "image/png", "image/webp", "image/heic"),
+		allowedExts:  set(".jpg", ".jpeg", ".png", ".webp", ".heic"),
+		publicMode:   true,
 	}, false))
 
-	r.Post("/meditation-tracks", uploadHandler(storagePath, baseURL, uploadConfig{
-		dirName:       "meditation-tracks",
-		maxSize:       maxAudioSize,
-		allowedMIMEs:  set("audio/mpeg", "audio/mp4", "audio/aac", "audio/x-m4a", "audio/m4a"),
-		allowedExts:   set(".mp3", ".m4a", ".aac"),
-		responseRoute: "/meditation-tracks/%s/stream",
+	r.Post("/meditation-tracks", uploadHandler(r2c, baseURL, uploadConfig{
+		keyPrefix:    "meditation-tracks",
+		maxSize:      maxAudioSize,
+		allowedMIMEs: set("audio/mpeg", "audio/mp4", "audio/aac", "audio/x-m4a", "audio/m4a"),
+		allowedExts:  set(".mp3", ".m4a", ".aac"),
+		publicMode:   false,
+		streamRoute:  "/meditation-tracks/%s/stream",
 	}, true))
 
-	r.Get("/avatars/{filename}", serveFileHandler(storagePath, "avatars", 24*time.Hour))
-	r.Get("/exercise-images/{filename}", serveFileHandler(storagePath, "exercise-images", 24*time.Hour))
-	r.Get("/meditation-tracks/{filename}/stream", serveFileHandler(storagePath, "meditation-tracks", 7*24*time.Hour))
+	// Image serve endpoints: redirect to the R2 public URL so clients that still
+	// hit /avatars/{f} keep working. New clients should use the FullURL from upload.
+	r.Get("/avatars/{filename}", redirectToPublicHandler(r2c, "avatars"))
+	r.Get("/exercise-images/{filename}", redirectToPublicHandler(r2c, "exercise-images"))
 
-	r.Delete("/avatars/{filename}", deleteFileHandler(storagePath, "avatars"))
-	r.Delete("/exercise-images/{filename}", deleteFileHandler(storagePath, "exercise-images"))
-	r.Delete("/meditation-tracks/{filename}", deleteFileHandler(storagePath, "meditation-tracks"))
+	// Audio serve endpoint: proxy from R2 with Range support.
+	r.Get("/meditation-tracks/{filename}/stream", proxyR2Handler(r2c, "meditation-tracks", 7*24*time.Hour))
 
-	log.Info().Str("port", port).Str("storage_path", storagePath).Msg("ballcoach-media listening")
+	r.Delete("/avatars/{filename}", deleteFileHandler(r2c, "avatars"))
+	r.Delete("/exercise-images/{filename}", deleteFileHandler(r2c, "exercise-images"))
+	r.Delete("/meditation-tracks/{filename}", deleteFileHandler(r2c, "meditation-tracks"))
+
+	log.Info().Str("port", port).Str("backend", "r2").Str("bucket", r2Cfg.bucket).Msg("ballcoach-media listening")
 	if err := http.ListenAndServe(":"+port, r); err != nil {
 		log.Fatal().Err(err).Msg("server failed")
 	}
 }
 
-func uploadHandler(storagePath, baseURL string, cfg uploadConfig, includeDuration bool) http.HandlerFunc {
+func uploadHandler(r2c *r2Client, baseURL string, cfg uploadConfig, includeDuration bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		r.Body = http.MaxBytesReader(w, r.Body, cfg.maxSize+(1*1024*1024))
 		if err := r.ParseMultipartForm(cfg.maxSize + (1 * 1024 * 1024)); err != nil {
@@ -287,48 +198,69 @@ func uploadHandler(storagePath, baseURL string, cfg uploadConfig, includeDuratio
 			return
 		}
 
-		targetDir := filepath.Join(storagePath, cfg.dirName)
-		if err := os.MkdirAll(targetDir, 0755); err != nil {
-			log.Error().Err(err).Str("dir", targetDir).Msg("failed to create directory")
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		dstPath := filepath.Join(targetDir, filename)
-		dst, err := os.Create(dstPath)
+		// Buffer the upload to a local temp file so we can both compute audio
+		// duration (which needs random access) and stream it to R2 with a known
+		// Content-Length.
+		tmp, err := os.CreateTemp("", "ballcoach-upload-*")
 		if err != nil {
-			log.Error().Err(err).Str("path", dstPath).Msg("failed to create destination file")
+			log.Error().Err(err).Msg("failed to create temp file")
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
+		tmpPath := tmp.Name()
+		defer func() {
+			_ = os.Remove(tmpPath)
+		}()
 
-		written, copyErr := io.Copy(dst, io.LimitReader(file, cfg.maxSize+1))
-		closeErr := dst.Close()
+		written, copyErr := io.Copy(tmp, io.LimitReader(file, cfg.maxSize+1))
+		closeErr := tmp.Close()
 		if copyErr != nil || closeErr != nil {
-			log.Error().Err(firstErr(copyErr, closeErr)).Str("path", dstPath).Msg("failed to save upload")
-			_ = os.Remove(dstPath)
+			log.Error().Err(firstErr(copyErr, closeErr)).Msg("failed to buffer upload")
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 
 		if written > cfg.maxSize {
-			_ = os.Remove(dstPath)
 			writeJSONError(w, http.StatusBadRequest, "file too large")
 			return
 		}
 
-		route := fmt.Sprintf(cfg.responseRoute, filename)
+		key := cfg.keyPrefix + "/" + filename
+		contentType := contentTypeForFilename(filename)
+
+		uploadFile, err := os.Open(tmpPath)
+		if err != nil {
+			log.Error().Err(err).Msg("failed to reopen temp file")
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+		putErr := r2c.put(r.Context(), key, contentType, uploadFile, written)
+		_ = uploadFile.Close()
+		if putErr != nil {
+			log.Error().Err(putErr).Str("key", key).Msg("failed to put object to R2")
+			http.Error(w, "internal server error", http.StatusInternalServerError)
+			return
+		}
+
 		resp := uploadResponse{
-			URL:       route,
-			FullURL:   resolveFullURL(baseURL, r, route),
 			Filename:  filename,
 			SizeBytes: written,
 		}
 
+		if cfg.publicMode {
+			publicURL := r2c.publicURL(key)
+			resp.URL = "/" + key
+			resp.FullURL = publicURL
+		} else {
+			route := fmt.Sprintf(cfg.streamRoute, filename)
+			resp.URL = route
+			resp.FullURL = resolveFullURL(baseURL, r, route)
+		}
+
 		if includeDuration {
-			durationSeconds, err := calculateAudioDurationSeconds(dstPath)
+			durationSeconds, err := calculateAudioDurationSeconds(tmpPath, filename)
 			if err != nil {
-				log.Warn().Err(err).Str("path", dstPath).Msg("failed to calculate audio duration")
+				log.Warn().Err(err).Str("filename", filename).Msg("failed to calculate audio duration")
 			}
 			resp.DurationSeconds = durationSeconds
 		}
@@ -339,46 +271,55 @@ func uploadHandler(storagePath, baseURL string, cfg uploadConfig, includeDuratio
 	}
 }
 
-func serveFileHandler(storagePath, dir string, cacheFor time.Duration) http.HandlerFunc {
+// redirectToPublicHandler 302-redirects to the public R2 URL. Used for images so
+// legacy clients hitting /avatars/{f} keep working while the file is actually
+// served by Cloudflare's CDN.
+func redirectToPublicHandler(r2c *r2Client, prefix string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		filename := chi.URLParam(r, "filename")
 		if !isValidFilename(filename) {
 			http.NotFound(w, r)
 			return
 		}
-
-		path := filepath.Join(storagePath, dir, filename)
-		info, err := os.Stat(path)
-		if err != nil || info.IsDir() {
-			http.NotFound(w, r)
-			return
-		}
-
-		w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(cacheFor.Seconds())))
-		if dir == "meditation-tracks" {
-			w.Header().Set("Accept-Ranges", "bytes")
-		}
-		http.ServeFile(w, r, path)
+		key := prefix + "/" + filename
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		http.Redirect(w, r, r2c.publicURL(key), http.StatusFound)
 	}
 }
 
-func deleteFileHandler(storagePath, dir string) http.HandlerFunc {
+func proxyR2Handler(r2c *r2Client, prefix string, cacheFor time.Duration) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		filename := chi.URLParam(r, "filename")
+		if !isValidFilename(filename) {
+			http.NotFound(w, r)
+			return
+		}
+		key := prefix + "/" + filename
+		r2c.proxyObject(r.Context(), w, r, key, cacheFor)
+	}
+}
+
+func deleteFileHandler(r2c *r2Client, prefix string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		filename := chi.URLParam(r, "filename")
 		if !isValidFilename(filename) {
 			writeJSONError(w, http.StatusNotFound, "file not found")
 			return
 		}
+		key := prefix + "/" + filename
 
-		path := filepath.Join(storagePath, dir, filename)
-		info, err := os.Stat(path)
-		if err != nil || info.IsDir() {
-			writeJSONError(w, http.StatusNotFound, "file not found")
+		if _, err := r2c.head(r.Context(), key); err != nil {
+			if isR2NotFound(err) {
+				writeJSONError(w, http.StatusNotFound, "file not found")
+				return
+			}
+			log.Error().Err(err).Str("key", key).Msg("failed to head object")
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
 
-		if err := os.Remove(path); err != nil {
-			log.Error().Err(err).Str("path", path).Msg("failed to delete file")
+		if err := r2c.delete(r.Context(), key); err != nil {
+			log.Error().Err(err).Str("key", key).Msg("failed to delete object")
 			http.Error(w, "internal server error", http.StatusInternalServerError)
 			return
 		}
@@ -436,7 +377,6 @@ func corsMiddleware(cfg originConfig) func(http.Handler) http.Handler {
 					w.Header().Set("Access-Control-Max-Age", "600")
 				}
 
-				// Internal service-to-service requests may have no Origin header.
 				if origin != "" && !allowed {
 					http.Error(w, "forbidden", http.StatusForbidden)
 					return
@@ -461,7 +401,6 @@ func uploadRateLimitMiddleware(limiter *ipRateLimiter) func(http.Handler) http.H
 				return
 			}
 
-			// Image upload endpoints are not rate-limited.
 			if r.URL.Path == "/avatars" || r.URL.Path == "/exercise-images" {
 				next.ServeHTTP(w, r)
 				return
@@ -472,9 +411,6 @@ func uploadRateLimitMiddleware(limiter *ipRateLimiter) func(http.Handler) http.H
 			if !allowed {
 				log.Warn().
 					Str("ip", ip).
-					Str("remote_addr", r.RemoteAddr).
-					Str("x_forwarded_for", r.Header.Get("X-Forwarded-For")).
-					Str("x_real_ip", r.Header.Get("X-Real-IP")).
 					Str("path", r.URL.Path).
 					Int("count", count).
 					Int("limit", limiter.limit).
@@ -485,12 +421,6 @@ func uploadRateLimitMiddleware(limiter *ipRateLimiter) func(http.Handler) http.H
 				return
 			}
 
-			log.Debug().
-				Str("ip", ip).
-				Int("count", count).
-				Int("limit", limiter.limit).
-				Msg("rate limit ok")
-
 			next.ServeHTTP(w, r)
 		})
 	}
@@ -498,7 +428,6 @@ func uploadRateLimitMiddleware(limiter *ipRateLimiter) func(http.Handler) http.H
 
 func resolveClientIP(r *http.Request) string {
 	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
-		// X-Forwarded-For can be a comma-separated list; the first entry is the original client.
 		if idx := strings.Index(xff, ","); idx >= 0 {
 			xff = strings.TrimSpace(xff[:idx])
 		}
@@ -609,28 +538,11 @@ func resolveFullURL(baseURL string, r *http.Request, route string) string {
 	return scheme + "://" + r.Host + route
 }
 
-func storageHealth(path string) (bool, int64) {
-	if err := os.MkdirAll(path, 0755); err != nil {
-		log.Warn().Err(err).Str("path", path).Msg("storage path unavailable")
-		return false, 0
-	}
-
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		log.Warn().Err(err).Str("path", path).Msg("storage stat failed")
-		return false, 0
-	}
-
-	free := int64(stat.Bavail) * int64(stat.Bsize)
-	return true, free / (1024 * 1024)
-}
-
 func isAllowedType(file multipart.File, hdr *multipart.FileHeader, targetFilename string, cfg uploadConfig) bool {
 	ctype := normalizeContentType(hdr.Header.Get("Content-Type"))
 	uploadExt := strings.ToLower(filepath.Ext(hdr.Filename))
 	targetExt := strings.ToLower(filepath.Ext(targetFilename))
 
-	// Validate both uploaded filename extension and target extension when present.
 	if uploadExt != "" {
 		if _, ok := cfg.allowedExts[uploadExt]; !ok {
 			return false
@@ -662,7 +574,6 @@ func isAllowedType(file multipart.File, hdr *multipart.FileHeader, targetFilenam
 		return true
 	}
 
-	// HEIC is often mislabeled; permit by extension if mime detection is ambiguous.
 	if targetExt == ".heic" || uploadExt == ".heic" {
 		_, ok := cfg.allowedExts[".heic"]
 		return ok
@@ -678,22 +589,27 @@ func normalizeContentType(value string) string {
 	return strings.ToLower(strings.TrimSpace(parts[0]))
 }
 
+func contentTypeForFilename(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	if ct := mime.TypeByExtension(ext); ct != "" {
+		return strings.SplitN(ct, ";", 2)[0]
+	}
+	return "application/octet-stream"
+}
+
 func writeJSONError(w http.ResponseWriter, status int, message string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(errorResponse{Error: message})
 }
 
-func calculateAudioDurationSeconds(path string) (int64, error) {
-	ext := strings.ToLower(filepath.Ext(path))
+func calculateAudioDurationSeconds(path, filename string) (int64, error) {
+	ext := strings.ToLower(filepath.Ext(filename))
 
 	switch ext {
 	case ".mp3":
 		return calculateMP3Duration(path)
 	case ".m4a", ".aac":
-		// M4A/AAC duration calculation not implemented yet
-		// Return 0 without error - duration will be 0 in response
-		log.Info().Str("path", path).Msg("M4A/AAC duration calculation not implemented - skipping")
 		return 0, nil
 	default:
 		return 0, fmt.Errorf("unsupported audio format: %s", ext)
@@ -777,94 +693,104 @@ func registerMIMETypes() {
 		".aac":  "audio/aac",
 	}
 	for ext, ct := range types {
-		mime.AddExtensionType(ext, ct)
+		_ = mime.AddExtensionType(ext, ct)
 	}
 }
 
-func migrateMP3ToM4A(meditationDir string) map[string]interface{} {
-	result := map[string]interface{}{
-		"status":    "success",
-		"converted": []string{},
-		"failed":    []string{},
-		"skipped":   []string{},
-		"errors":    []string{},
+// migrateVolumeToR2 walks the legacy Railway volume layout and uploads every
+// file to R2 with key `<dir>/<filename>`. Idempotent: skips keys that already
+// exist in R2.
+func migrateVolumeToR2(ctx context.Context, r2c *r2Client, basePath string) map[string]any {
+	result := map[string]any{
+		"status":   "success",
+		"uploaded": []string{},
+		"skipped":  []string{},
+		"failed":   []string{},
+		"errors":   []string{},
 	}
 
-	// Check if directory exists
-	if _, err := os.Stat(meditationDir); os.IsNotExist(err) {
-		result["status"] = "error"
-		result["errors"] = []string{fmt.Sprintf("directory does not exist: %s", meditationDir)}
-		return result
+	// (sourceDir → R2 key prefix). The first two are the standard layout under
+	// MEDIA_STORAGE_PATH; the last is the legacy meditation-audio direct volume
+	// mount.
+	dirMappings := []struct {
+		src       string
+		keyPrefix string
+	}{
+		{filepath.Join(basePath, "avatars"), "avatars"},
+		{filepath.Join(basePath, "exercise-images"), "exercise-images"},
+		{filepath.Join(basePath, "meditation-tracks"), "meditation-tracks"},
+		{"/data/meditation-audio", "meditation-tracks"},
 	}
 
-	// Read directory
-	entries, err := os.ReadDir(meditationDir)
-	if err != nil {
-		result["status"] = "error"
-		result["errors"] = []string{fmt.Sprintf("failed to read directory: %v", err)}
-		return result
-	}
-
-	converted := []string{}
-	failed := []string{}
+	uploaded := []string{}
 	skipped := []string{}
-	errors := []string{}
+	failed := []string{}
+	errs := []string{}
 
-	for _, entry := range entries {
-		if entry.IsDir() || strings.ToLower(filepath.Ext(entry.Name())) != ".mp3" {
-			continue
-		}
-
-		filename := entry.Name()
-		mp3Path := filepath.Join(meditationDir, filename)
-		m4aFilename := strings.TrimSuffix(filename, ".mp3") + ".m4a"
-		m4aPath := filepath.Join(meditationDir, m4aFilename)
-
-		// Check if M4A already exists
-		if _, err := os.Stat(m4aPath); err == nil {
-			skipped = append(skipped, filename)
-			log.Info().Str("file", filename).Msg("M4A already exists, skipping")
-			continue
-		}
-
-		// Convert using ffmpeg
-		cmd := exec.Command("ffmpeg",
-			"-i", mp3Path,
-			"-c:a", "aac",
-			"-b:a", "128k",
-			"-vn",
-			"-y",
-			m4aPath,
-		)
-
-		output, err := cmd.CombinedOutput()
+	for _, m := range dirMappings {
+		entries, err := os.ReadDir(m.src)
 		if err != nil {
-			errMsg := fmt.Sprintf("%s: %v - %s", filename, err, string(output))
-			failed = append(failed, filename)
-			errors = append(errors, errMsg)
-			log.Error().Str("file", filename).Err(err).Msg("conversion failed")
+			if os.IsNotExist(err) {
+				continue
+			}
+			errs = append(errs, fmt.Sprintf("read %s: %v", m.src, err))
 			continue
 		}
 
-		// Verify the M4A file was created
-		if stat, err := os.Stat(m4aPath); err == nil {
-			converted = append(converted, m4aFilename)
-			log.Info().Str("file", m4aFilename).Int64("size", stat.Size()).Msg("conversion successful")
-		} else {
-			failed = append(failed, filename)
-			errors = append(errors, fmt.Sprintf("%s: M4A file not created", filename))
-			log.Error().Str("file", filename).Msg("M4A file not created")
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			filename := entry.Name()
+			if !isValidFilename(filename) {
+				continue
+			}
+			localPath := filepath.Join(m.src, filename)
+			key := m.keyPrefix + "/" + filename
+
+			if _, err := r2c.head(ctx, key); err == nil {
+				skipped = append(skipped, key)
+				continue
+			} else if !isR2NotFound(err) {
+				errs = append(errs, fmt.Sprintf("head %s: %v", key, err))
+				failed = append(failed, key)
+				continue
+			}
+
+			info, err := entry.Info()
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("stat %s: %v", localPath, err))
+				failed = append(failed, key)
+				continue
+			}
+
+			f, err := os.Open(localPath)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("open %s: %v", localPath, err))
+				failed = append(failed, key)
+				continue
+			}
+			ct := contentTypeForFilename(filename)
+			putErr := r2c.put(ctx, key, ct, f, info.Size())
+			_ = f.Close()
+			if putErr != nil {
+				errs = append(errs, fmt.Sprintf("put %s: %v", key, putErr))
+				failed = append(failed, key)
+				log.Error().Err(putErr).Str("key", key).Msg("migration upload failed")
+				continue
+			}
+
+			uploaded = append(uploaded, key)
+			log.Info().Str("key", key).Int64("size", info.Size()).Msg("migrated to R2")
 		}
 	}
 
-	result["converted"] = converted
-	result["failed"] = failed
+	result["uploaded"] = uploaded
 	result["skipped"] = skipped
-	result["errors"] = errors
-
+	result["failed"] = failed
+	result["errors"] = errs
 	if len(failed) > 0 {
 		result["status"] = "partial"
 	}
-
 	return result
 }
